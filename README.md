@@ -18,7 +18,7 @@
 
 hostgraph is a desktop app that draws your Linux host's network exposure as an interactive, drag-and-drop graph. It shows both directions: what the outside world can reach on your machine, and how that traffic gets to processes and containers.
 
-**Status:** early development. Nothing below works yet; it is the plan.
+**Status:** working prototype. Listening sockets, firewalld, podman/docker and bridges are collected; nftables and Kubernetes are not yet.
 
 ## Why
 
@@ -26,14 +26,19 @@ You open a firewall port so another machine can reach a project. Then podman, do
 
 hostgraph collects all of that into one picture.
 
-## Planned features
+## Features
 
-- **Firewall:** open ports and services per zone (firewalld, nftables)
-- **Listening sockets:** every listening port and the process that owns it
-- **Container forwarding:** podman and docker published ports (DNAT rules)
+- **Listening sockets:** every listening TCP/UDP port, its bind address (loopback, one interface, or all), and the process that owns it
+- **Firewall:** active firewalld zones plus the default zone, their interfaces, and the ports they open through ports, services, port ranges and rich rules
+- **Container forwarding:** podman and docker published ports, linked to the container behind them
+- **Bridges:** host bridges such as `virbr*` and `docker0`, and container networks
+- **Gap detection:** flags ports the firewall opens with nothing listening, ports opened but bound to loopback only, and services listening on all interfaces that no zone allows
+- **Canvas:** drag nodes, search, filter (loopback, unlinked, findings only), and click a node or finding for details
+
+Planned:
+
+- **nftables:** rules outside firewalld (`nft -j list ruleset`)
 - **Kubernetes:** k8s and kind services, NodePorts, and pods
-- **Bridges:** `docker0`, `cni0`, `podman*`, `virbr*`, and the interfaces attached to them
-- **Gap detection:** flag ports that are open in the firewall but have no listener, and listeners that the firewall blocks
 
 ## Architecture
 
@@ -50,11 +55,12 @@ Data sources:
 
 | Source | How |
 |--------|-----|
-| firewalld | D-Bus (`zbus`) |
-| nftables | `nft -j list ruleset` |
-| Listening sockets | `/proc/net` (`procfs`) |
-| docker / podman | Engine API socket (`bollard`) |
-| Kubernetes | kube API (`kube`) |
+| Listening sockets | `/proc/net/{tcp,udp}{,6}` and `/proc/<pid>/fd` (`procfs`) |
+| Interfaces and bridges | `/sys/class/net` |
+| firewalld | system D-Bus (`zbus`) |
+| docker / podman | Docker-compatible API socket (`bollard`) |
+| nftables (planned) | `nft -j list ruleset` |
+| Kubernetes (planned) | kube API (`kube`) |
 
 ## Development
 
@@ -71,13 +77,14 @@ pnpm install
 pnpm tauri dev
 ```
 
-Check the Rust workspace only:
+Test the Rust workspace, or print the collected graph as JSON without the UI:
 
 ```bash
-cargo check --workspace
+cargo test --workspace
+cargo run -p hostgraph-core --example dump
 ```
 
-Some data (other users' processes, nftables rules) needs elevated privileges to read. hostgraph only reads host state; it never changes firewall or container configuration.
+hostgraph only reads host state; it never changes firewall or container configuration. Without root, ports owned by other users appear without a process. Docker is queried only if `dockerd` is already running, because connecting to a socket-activated `docker.sock` would start the daemon.
 
 ## License
 

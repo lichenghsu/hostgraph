@@ -1,19 +1,11 @@
-use hostgraph_core::collect::sockets;
+use hostgraph_core::collect::collect_all;
 use hostgraph_core::model::Graph;
 
-/// Collect the host's current network state as a graph.
-///
-/// Scanning /proc walks every process's fds, so run it off the main thread
-/// to keep the window responsive.
+/// Collect the host's current network state as a graph: interfaces,
+/// listening sockets, firewalld zones, containers, and the gaps between them.
 #[tauri::command]
-async fn get_graph() -> Result<Graph, String> {
-    tauri::async_runtime::spawn_blocking(|| {
-        let mut g = Graph::default();
-        sockets::collect(&mut g);
-        g
-    })
-    .await
-    .map_err(|e| e.to_string())
+async fn get_graph() -> Graph {
+    collect_all().await
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
