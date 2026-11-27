@@ -1,19 +1,22 @@
 use std::collections::HashMap;
+use std::net::IpAddr;
 use procfs::net::{TcpState, UdpState};
 use procfs::process::{all_processes, FDTarget};
 
-use crate::model::{EdgeKind, Graph, NodeKind, Proto};
+use crate::model::{EdgeKind, Exposure, Graph, NodeKind, Proto};
 
 /// A socket bound to a local port and waiting for traffic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Listener {
     proto: Proto,
+    addr: IpAddr,
     port: u16,
     inode: u64,
 }
 
 /// Add every listening socket to the graph: a Port node per (proto, port),
-/// a Process node per owning pid, and a ListensOn edge between them.
+/// a Process node per owning pid, and a ListensOn edge (with the bind
+/// address) between them.
 ///
 /// Reads the current network namespace only. Without root, sockets owned by
 /// other users still appear as Port nodes, just without a Process.
@@ -23,20 +26,32 @@ pub fn collect(g: &mut Graph) {
 
 /// Turn listeners and their owners into graph nodes and edges.
 fn build(listeners: &[Listener], owners: &HashMap<u64, (i32, String)>, g: &mut Graph) {
+    // A port can be bound on several addresses; the node shows the widest.
+    let mut widest: HashMap<String, Exposure> = HashMap::new();
     for l in listeners {
-        let proto = match l.proto {
-            Proto::Tcp => "tcp",
-            Proto::Udp => "udp",
-        };
-        let port_id = format!("port:{proto}:{}", l.port);
-        g.add_node(port_id.clone(), NodeKind::Port { proto: l.proto, port: l.port });
+        let e = widest.entry(port_id(l)).or_insert(Exposure::Loopback);
+        *e = (*e).max(Exposure::of(l.addr));
+    }
+
+    for l in listeners {
+        let port_id = port_id(l);
+        let exposure = widest[&port_id];
+        g.add_node(port_id.clone(), NodeKind::Port { proto: l.proto, port: l.port, exposure });
 
         if let Some((pid, name)) = owners.get(&l.inode) {
             let proc_id = format!("proc:{pid}");
             g.add_node(proc_id.clone(), NodeKind::Process { pid: *pid, name: name.clone() });
-            g.add_edge(&proc_id, &port_id, EdgeKind::ListensOn);
+            g.add_edge(&proc_id, &port_id, EdgeKind::ListensOn { addr: l.addr });
         }
     }
+}
+
+fn port_id(l: &Listener) -> String {
+    let proto = match l.proto {
+        Proto::Tcp => "tcp",
+        Proto::Udp => "udp",
+    };
+    format!("port:{proto}:{}", l.port)
 }
 
 /// Read listening sockets from /proc/net/{tcp,tcp6,udp,udp6}.
@@ -49,7 +64,12 @@ fn read_listeners() -> Vec<Listener> {
     for table in [procfs::net::tcp(), procfs::net::tcp6()] {
         for e in table.into_iter().flatten() {
             if e.state == TcpState::Listen {
-                out.push(Listener { proto: Proto::Tcp, port: e.local_address.port(), inode: e.inode });
+                out.push(Listener {
+                    proto: Proto::Tcp,
+                    addr: e.local_address.ip(),
+                    port: e.local_address.port(),
+                    inode: e.inode,
+                });
             }
         }
     }
@@ -57,7 +77,12 @@ fn read_listeners() -> Vec<Listener> {
     for table in [procfs::net::udp(), procfs::net::udp6()] {
         for e in table.into_iter().flatten() {
             if e.state == UdpState::Close && e.remote_address.port() == 0 {
-                out.push(Listener { proto: Proto::Udp, port: e.local_address.port(), inode: e.inode });
+                out.push(Listener {
+                    proto: Proto::Udp,
+                    addr: e.local_address.ip(),
+                    port: e.local_address.port(),
+                    inode: e.inode,
+                });
             }
         }
     }
@@ -112,14 +137,25 @@ mod tests {
         assert_eq!(*pid, std::process::id() as i32);
     }
 
+    fn l(proto: Proto, addr: &str, port: u16, inode: u64) -> Listener {
+        Listener { proto, addr: addr.parse().unwrap(), port, inode }
+    }
+
+    fn port_exposure(g: &Graph, id: &str) -> Exposure {
+        match g.nodes.iter().find(|n| n.id == id).map(|n| &n.kind) {
+            Some(NodeKind::Port { exposure, .. }) => *exposure,
+            other => panic!("{id} is not a port node: {other:?}"),
+        }
+    }
+
     #[test]
     fn build_links_owner_and_skips_unknown() {
         let listeners = vec![
-            Listener { proto: Proto::Tcp, port: 22, inode: 100 },
-            // Same port on IPv6: must not duplicate the node or the edge
-            Listener { proto: Proto::Tcp, port: 22, inode: 101 },
+            l(Proto::Tcp, "0.0.0.0", 22, 100),
+            // Same port on IPv6: one node, a second edge with its own addr
+            l(Proto::Tcp, "::", 22, 101),
             // Owner unknown (no permission): port only
-            Listener { proto: Proto::Udp, port: 53, inode: 200 },
+            l(Proto::Udp, "127.0.0.53", 53, 200),
         ];
         let owners = HashMap::from([
             (100, (1, "sshd".to_string())),
@@ -131,9 +167,40 @@ mod tests {
 
         let ids: Vec<_> = g.nodes.iter().map(|n| n.id.as_str()).collect();
         assert_eq!(ids, ["port:tcp:22", "proc:1", "port:udp:53"]);
-        assert_eq!(g.edges.len(), 1);
-        assert_eq!(g.edges[0].from, "proc:1");
-        assert_eq!(g.edges[0].to, "port:tcp:22");
+
+        let addrs: Vec<_> = g
+            .edges
+            .iter()
+            .map(|e| match e.kind {
+                EdgeKind::ListensOn { addr } => (e.from.as_str(), e.to.as_str(), addr.to_string()),
+                other => panic!("unexpected edge {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            addrs,
+            [
+                ("proc:1", "port:tcp:22", "0.0.0.0".to_string()),
+                ("proc:1", "port:tcp:22", "::".to_string()),
+            ]
+        );
+
+        assert_eq!(port_exposure(&g, "port:udp:53"), Exposure::Loopback);
+    }
+
+    #[test]
+    fn port_takes_widest_exposure() {
+        // Loopback bind first, wildcard second: node must still say Any
+        let listeners = vec![
+            l(Proto::Tcp, "127.0.0.1", 8080, 1),
+            l(Proto::Tcp, "0.0.0.0", 8080, 2),
+            l(Proto::Tcp, "192.168.1.10", 9000, 3),
+            l(Proto::Tcp, "::1", 9000, 4),
+        ];
+        let mut g = Graph::default();
+        build(&listeners, &HashMap::new(), &mut g);
+
+        assert_eq!(port_exposure(&g, "port:tcp:8080"), Exposure::Any);
+        assert_eq!(port_exposure(&g, "port:tcp:9000"), Exposure::Specific);
     }
 
     #[test]

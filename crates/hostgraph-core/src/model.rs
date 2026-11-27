@@ -1,3 +1,5 @@
+use std::net::IpAddr;
+
 use serde::Serialize;
 
 /// Transport protocol
@@ -6,6 +8,36 @@ use serde::Serialize;
 pub enum Proto {
     Tcp,
     Udp,
+}
+
+/// Who can reach a socket, judged from its bind address.
+/// Ordered narrowest to widest, so `max()` gives the widest exposure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Exposure {
+    /// 127.0.0.0/8 or ::1: this host only
+    Loopback,
+    /// One specific interface address, e.g. a LAN IP or a bridge gateway
+    Specific,
+    /// 0.0.0.0 or ::: every interface
+    Any,
+}
+
+impl Exposure {
+    pub fn of(addr: IpAddr) -> Self {
+        // Unwrap IPv4-mapped IPv6 such as ::ffff:127.0.0.1
+        let addr = match addr {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(addr, IpAddr::V4),
+            v4 => v4,
+        };
+        if addr.is_unspecified() {
+            Exposure::Any
+        } else if addr.is_loopback() {
+            Exposure::Loopback
+        } else {
+            Exposure::Specific
+        }
+    }
 }
 
 /// Kind of a node in the graph, each variant carrying its own fields
@@ -24,6 +56,8 @@ pub enum NodeKind {
     Port {
         proto: Proto,
         port: u16,
+        /// Widest exposure among all sockets bound to this port
+        exposure: Exposure,
     },
     Process {
         pid: i32,
@@ -49,18 +83,23 @@ pub struct Node {
 
 /// Kind of an edge in the graph, describing the relationship between two nodes
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EdgeKind {
-    Exposes,    // zone -> port
-    ListensOn,  // process -> port
-    ForwardsTo, // port -> container (DNAT)
-    AttachedTo, // container -> bridge
+    /// zone -> port
+    Exposes,
+    /// process -> port, bound on `addr`
+    ListensOn { addr: IpAddr },
+    /// port -> container (DNAT)
+    ForwardsTo,
+    /// container -> bridge
+    AttachedTo,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Edge {
     pub from: String,
     pub to: String,
+    #[serde(flatten)]
     pub kind: EdgeKind,
 }
 
@@ -107,6 +146,7 @@ mod tests {
             NodeKind::Port {
                 proto: Proto::Tcp,
                 port: 22,
+                exposure: Exposure::Any,
             },
         );
         g.add_node(
@@ -116,10 +156,29 @@ mod tests {
                 name: "sshd".into(),
             },
         );
-        g.add_edge("proc:1234", "port:tcp:22", EdgeKind::ListensOn);
+        g.add_edge(
+            "proc:1234",
+            "port:tcp:22",
+            EdgeKind::ListensOn {
+                addr: "0.0.0.0".parse().unwrap(),
+            },
+        );
 
         let json = serde_json::to_string(&g).unwrap();
-        assert!(json.contains(r#""kind":"port","proto":"tcp","port":22"#));
-        assert!(json.contains(r#""kind":"listens_on""#));
+        assert!(json.contains(r#""kind":"port","proto":"tcp","port":22,"exposure":"any""#));
+        assert!(json.contains(r#""kind":"listens_on","addr":"0.0.0.0""#));
+    }
+
+    #[test]
+    fn exposure_from_addr() {
+        let of = |s: &str| Exposure::of(s.parse().unwrap());
+        assert_eq!(of("0.0.0.0"), Exposure::Any);
+        assert_eq!(of("::"), Exposure::Any);
+        assert_eq!(of("127.0.0.53"), Exposure::Loopback);
+        assert_eq!(of("::1"), Exposure::Loopback);
+        assert_eq!(of("::ffff:127.0.0.1"), Exposure::Loopback);
+        assert_eq!(of("192.168.1.10"), Exposure::Specific);
+        assert_eq!(of("fe80::1"), Exposure::Specific);
+        assert!(Exposure::Loopback < Exposure::Specific && Exposure::Specific < Exposure::Any);
     }
 }
