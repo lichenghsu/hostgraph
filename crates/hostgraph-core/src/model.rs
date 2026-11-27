@@ -48,7 +48,7 @@ pub struct Node {
 }
 
 /// Kind of an edge in the graph, describing the relationship between two nodes
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EdgeKind {
     Exposes,    // zone -> port
@@ -78,7 +78,15 @@ impl Graph {
         }
     }
 
+    /// Add an edge; an identical (from, to, kind) edge is added only once.
     pub fn add_edge(&mut self, from: &str, to: &str, kind: EdgeKind) {
+        if self
+            .edges
+            .iter()
+            .any(|e| e.from == from && e.to == to && e.kind == kind)
+        {
+            return;
+        }
         self.edges.push(Edge {
             from: from.to_string(),
             to: to.to_string(),
