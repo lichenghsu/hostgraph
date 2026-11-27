@@ -3,7 +3,7 @@ use std::net::IpAddr;
 use procfs::net::{TcpState, UdpState};
 use procfs::process::{all_processes, FDTarget};
 
-use crate::model::{EdgeKind, Exposure, Graph, NodeKind, Proto};
+use crate::model::{port_id, EdgeKind, Exposure, Graph, NodeKind, Proto};
 
 /// A socket bound to a local port and waiting for traffic.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,13 +29,13 @@ fn build(listeners: &[Listener], owners: &HashMap<u64, (i32, String)>, g: &mut G
     // A port can be bound on several addresses; the node shows the widest.
     let mut widest: HashMap<String, Exposure> = HashMap::new();
     for l in listeners {
-        let e = widest.entry(port_id(l)).or_insert(Exposure::Loopback);
+        let e = widest.entry(port_id(l.proto, l.port)).or_insert(Exposure::Loopback);
         *e = (*e).max(Exposure::of(l.addr));
     }
 
     for l in listeners {
-        let port_id = port_id(l);
-        let exposure = widest[&port_id];
+        let port_id = port_id(l.proto, l.port);
+        let exposure = Some(widest[&port_id]);
         g.add_node(port_id.clone(), NodeKind::Port { proto: l.proto, port: l.port, exposure });
 
         if let Some((pid, name)) = owners.get(&l.inode) {
@@ -46,13 +46,6 @@ fn build(listeners: &[Listener], owners: &HashMap<u64, (i32, String)>, g: &mut G
     }
 }
 
-fn port_id(l: &Listener) -> String {
-    let proto = match l.proto {
-        Proto::Tcp => "tcp",
-        Proto::Udp => "udp",
-    };
-    format!("port:{proto}:{}", l.port)
-}
 
 /// Read listening sockets from /proc/net/{tcp,tcp6,udp,udp6}.
 ///
@@ -143,7 +136,7 @@ mod tests {
 
     fn port_exposure(g: &Graph, id: &str) -> Exposure {
         match g.nodes.iter().find(|n| n.id == id).map(|n| &n.kind) {
-            Some(NodeKind::Port { exposure, .. }) => *exposure,
+            Some(NodeKind::Port { exposure: Some(e), .. }) => *e,
             other => panic!("{id} is not a port node: {other:?}"),
         }
     }
@@ -171,7 +164,7 @@ mod tests {
         let addrs: Vec<_> = g
             .edges
             .iter()
-            .map(|e| match e.kind {
+            .map(|e| match &e.kind {
                 EdgeKind::ListensOn { addr } => (e.from.as_str(), e.to.as_str(), addr.to_string()),
                 other => panic!("unexpected edge {other:?}"),
             })
