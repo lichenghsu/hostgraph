@@ -5,6 +5,9 @@ use procfs::process::{all_processes, FDTarget};
 
 use crate::model::{port_id, EdgeKind, Exposure, Graph, NodeKind, Proto};
 
+/// Socket inode -> (pid, process name)
+pub type Owners = HashMap<u64, (i32, String)>;
+
 /// A socket bound to a local port and waiting for traffic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Listener {
@@ -19,13 +22,16 @@ struct Listener {
 /// address) between them.
 ///
 /// Reads the current network namespace only. Without root, sockets owned by
-/// other users still appear as Port nodes, just without a Process.
-pub fn collect(g: &mut Graph) {
-    build(&read_listeners(), &socket_owners(), g);
+/// other users still appear as Port nodes, just without a Process; pass
+/// owners read by a privileged helper in `extra` to fill them in.
+pub fn collect(g: &mut Graph, extra: &Owners) {
+    let mut owners = socket_owners();
+    owners.extend(extra.iter().map(|(k, v)| (*k, v.clone())));
+    build(&read_listeners(), &owners, g);
 }
 
 /// Turn listeners and their owners into graph nodes and edges.
-fn build(listeners: &[Listener], owners: &HashMap<u64, (i32, String)>, g: &mut Graph) {
+fn build(listeners: &[Listener], owners: &Owners, g: &mut Graph) {
     // A port can be bound on several addresses; the node shows the widest.
     let mut widest: HashMap<String, Exposure> = HashMap::new();
     for l in listeners {
@@ -83,11 +89,12 @@ fn read_listeners() -> Vec<Listener> {
     out
 }
 
-/// socket inode -> (pid, process name)
+/// Map every socket inode to the process holding it.
 ///
 /// Processes that vanish mid-scan or whose fds we cannot read (other users'
-/// processes without root) are skipped, so the map may be partial.
-fn socket_owners() -> HashMap<u64, (i32, String)> {
+/// processes without root) are skipped, so the map may be partial. Run as
+/// root to get the full map.
+pub fn socket_owners() -> Owners {
     let mut map = HashMap::new();
 
     let Ok(procs) = all_processes() else {
@@ -197,6 +204,26 @@ mod tests {
     }
 
     #[test]
+    fn extra_owners_fill_in_and_win() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let inode = procfs::net::tcp()
+            .unwrap()
+            .into_iter()
+            .find(|e| e.local_address.port() == port)
+            .unwrap()
+            .inode;
+
+        // As if a root helper reported a different owner for this socket
+        let extra = Owners::from([(inode, (999_999, "from-root".to_string()))]);
+        let mut g = Graph::default();
+        collect(&mut g, &extra);
+
+        let port_id = format!("port:tcp:{port}");
+        assert!(g.edges.iter().any(|e| e.from == "proc:999999" && e.to == port_id));
+    }
+
+    #[test]
     fn collect_sees_own_tcp_and_udp() {
         let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
         let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -205,7 +232,7 @@ mod tests {
         let me = format!("proc:{}", std::process::id());
 
         let mut g = Graph::default();
-        collect(&mut g);
+        collect(&mut g, &Owners::new());
 
         for port in [&tcp_port, &udp_port] {
             assert!(

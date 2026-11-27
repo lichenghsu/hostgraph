@@ -58,12 +58,14 @@ function Canvas() {
   const [selected, setSelected] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  // Root scans prompt for a password each time, so they are opt-in
+  const [asRoot, setAsRoot] = useState(false);
   const [nodes, setNodes, onNodesChange] = useNodesState<Node<NodeData>>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
   const pinned = useRef(new Map<string, { x: number; y: number }>());
   const { fitView, setCenter, getNode } = useReactFlow();
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (privileged: boolean) => {
     // The Rust backend exists only inside the Tauri webview, not a plain browser tab.
     if (!isTauri()) {
       setError("No Tauri backend: run `pnpm tauri dev` and use the app window, not the browser.");
@@ -72,7 +74,7 @@ function Canvas() {
     setLoading(true);
     setError(null);
     try {
-      setGraph(await invoke<HgGraph>("get_graph"));
+      setGraph(await invoke<HgGraph>("get_graph", { privileged }));
     } catch (e) {
       setError(String(e));
     } finally {
@@ -81,7 +83,7 @@ function Canvas() {
   }, []);
 
   useEffect(() => {
-    refresh();
+    refresh(false);
   }, [refresh]);
 
   // Re-layout whenever data or filters change; dragged nodes keep their spot
@@ -129,9 +131,21 @@ function Canvas() {
           <Controls />
           <MiniMap pannable zoomable />
           <Panel position="top-left" className="toolbar">
-            <button onClick={refresh} disabled={loading}>
+            <button onClick={() => refresh(asRoot)} disabled={loading}>
               {loading ? "Scanning…" : "Refresh"}
             </button>
+            <label title="Read process owners as root via pkexec; asks for your password on each scan">
+              <input
+                type="checkbox"
+                checked={asRoot}
+                disabled={loading}
+                onChange={(e) => {
+                  setAsRoot(e.target.checked);
+                  refresh(e.target.checked);
+                }}
+              />
+              As root
+            </label>
             <input
               type="search"
               placeholder="Search port, process, zone…"
@@ -280,7 +294,7 @@ function Sidebar(props: {
 
       <section>
         <p className="muted small">
-          Read-only. Without root, ports owned by other users show no process. Docker is skipped unless dockerd is
+          Read-only. Without "As root", ports owned by other users show no process. Docker is skipped unless dockerd is
           already running.
         </p>
       </section>
