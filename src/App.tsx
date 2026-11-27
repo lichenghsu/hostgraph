@@ -1,50 +1,95 @@
-import { useState } from "react";
-import reactLogo from "./assets/react.svg";
-import { invoke } from "@tauri-apps/api/core";
+import { useCallback, useEffect, useState } from "react";
+import { invoke, isTauri } from "@tauri-apps/api/core";
+import {
+  Background,
+  Controls,
+  Handle,
+  MiniMap,
+  Panel,
+  Position,
+  ReactFlow,
+  useEdgesState,
+  useNodesState,
+  type Edge,
+  type Node,
+  type NodeProps,
+} from "@xyflow/react";
+import "@xyflow/react/dist/style.css";
 import "./App.css";
+import { toFlow, type HgGraph, type NodeData } from "./graph";
+
+function HgNodeView({ data }: NodeProps<Node<NodeData>>) {
+  const hg = data.hg;
+  const exposure = hg.kind === "port" ? ` exposure-${hg.exposure}` : "";
+  return (
+    <div className={`hg-node kind-${hg.kind}${exposure}`}>
+      <Handle type="target" position={Position.Left} />
+      <div className="hg-label">{data.label}</div>
+      {data.sub && <div className="hg-sub">{data.sub}</div>}
+      <Handle type="source" position={Position.Right} />
+    </div>
+  );
+}
+
+const nodeTypes = { hg: HgNodeView };
 
 function App() {
-  const [greetMsg, setGreetMsg] = useState("");
-  const [name, setName] = useState("");
+  const [nodes, setNodes, onNodesChange] = useNodesState<Node<NodeData>>([]);
+  const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
 
-  async function greet() {
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-    setGreetMsg(await invoke("greet", { name }));
-  }
+  const refresh = useCallback(async () => {
+    // The Rust backend exists only inside the Tauri webview, not a plain browser tab.
+    if (!isTauri()) {
+      setError("No Tauri backend: run `pnpm tauri dev` and use the app window, not the browser.");
+      return;
+    }
+    setLoading(true);
+    setError(null);
+    try {
+      const flow = toFlow(await invoke<HgGraph>("get_graph"));
+      setNodes(flow.nodes);
+      setEdges(flow.edges);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setLoading(false);
+    }
+  }, [setNodes, setEdges]);
+
+  useEffect(() => {
+    refresh();
+  }, [refresh]);
 
   return (
-    <main className="container">
-      <h1>Welcome to Tauri + React</h1>
-
-      <div className="row">
-        <a href="https://vite.dev" target="_blank">
-          <img src="/vite.svg" className="logo vite" alt="Vite logo" />
-        </a>
-        <a href="https://tauri.app" target="_blank">
-          <img src="/tauri.svg" className="logo tauri" alt="Tauri logo" />
-        </a>
-        <a href="https://react.dev" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
-      </div>
-      <p>Click on the Tauri, Vite, and React logos to learn more.</p>
-
-      <form
-        className="row"
-        onSubmit={(e) => {
-          e.preventDefault();
-          greet();
-        }}
+    <div className="app">
+      <ReactFlow
+        nodes={nodes}
+        edges={edges}
+        nodeTypes={nodeTypes}
+        onNodesChange={onNodesChange}
+        onEdgesChange={onEdgesChange}
+        nodesConnectable={false}
+        fitView
+        minZoom={0.1}
       >
-        <input
-          id="greet-input"
-          onChange={(e) => setName(e.currentTarget.value)}
-          placeholder="Enter a name..."
-        />
-        <button type="submit">Greet</button>
-      </form>
-      <p>{greetMsg}</p>
-    </main>
+        <Background />
+        <Controls />
+        <MiniMap pannable zoomable />
+        <Panel position="top-left" className="toolbar">
+          <button onClick={refresh} disabled={loading}>
+            {loading ? "Scanning…" : "Refresh"}
+          </button>
+          <span className="legend">
+            <i className="dot exposure-any" /> any
+            <i className="dot exposure-specific" /> specific
+            <i className="dot exposure-loopback" /> loopback
+          </span>
+          {error && <span className="error">{error}</span>}
+        </Panel>
+      </ReactFlow>
+    </div>
   );
 }
 
